@@ -25,7 +25,7 @@ This implementation emphasizes modularity, concurrent execution, and precise dat
 
 ## 🏗️ System Architecture
 
-![PRNG Datapath](./assest/SystemArchitecture.png)
+![PRNG Datapath](./assets/SystemArchitecture.png)
 
 
 ![[Pasted image 20260903192002.png]]
