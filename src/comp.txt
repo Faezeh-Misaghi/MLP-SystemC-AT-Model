@@ -1,0 +1,657 @@
+accelerator
+
+#ifndef ACCELERATOR_HPP
+#define ACCELERATOR_HPP
+
+#include <systemc>
+#include <vector>
+#include <algorithm>
+#include <iostream>
+#include "CPU_ACC_IF.hpp"
+#include "Mem_ACC_IF.hpp"
+
+using namespace sc_core;
+using namespace std;
+
+class Accelerator : public sc_module {
+public:
+    sc_port<CPU_ACC_IF> cpu_port;
+    sc_port<MemACC_IF> mem_port;
+
+    SC_CTOR(Accelerator) {
+        SC_THREAD(process);
+    }
+
+private:
+    void process() {
+        cout << sc_time_stamp() << " [Accelerator] process() thread started." << endl;
+
+        // Wait for CPU to start
+        cpu_port->wait_for_start();
+        cout << sc_time_stamp() << " [Accelerator] wait_for_start() done." << endl;
+
+        // Receive network configuration and input
+        vector<int> layer_sizes = cpu_port->get_layer_sizes();
+        vector<float> current = cpu_port->get_input_vector();
+        cout << sc_time_stamp() << " [Accelerator] Received layer sizes and input." << endl;
+
+        for (size_t l = 0; l < layer_sizes.size() - 1; ++l) {
+            int in_size = layer_sizes[l];
+            int out_size = layer_sizes[l + 1];
+            cout << sc_time_stamp() << " [Accelerator] Starting layer " << l << " (" 
+                 << in_size << " -> " << out_size << ")" << endl;
+
+
+            // Request weights and biases from memory
+            mem_port->request_layer(l, in_size, out_size);
+            mem_port->wait_data_ready();
+            vector<float> weights = mem_port->get_weights();   // size: out_size * in_size
+            vector<float> biases = mem_port->get_biases();     // size: out_size
+
+            // Compute layer output
+            vector<float> output(out_size, 0.0f);
+            for (int i = 0; i < out_size; ++i) {
+                for (int j = 0; j < in_size; ++j) {
+                    output[i] += current[j] * weights[i * in_size + j];
+                }
+                output[i] += biases[i];
+                output[i] = max(0.0f, output[i]);  // ReLU activation
+            }
+
+            cout << sc_time_stamp() << " [Accelerator] Layer " << l << " output: ";
+            for (float val : output) cout << val << " ";
+            cout << endl;
+
+            current = output;             // Pass output to next layer
+            cpu_port->notify_done();      // Inform CPU this layer is done
+            wait(10, SC_NS);              // Simulate latency
+        }
+
+        // Final output to CPU
+        cpu_port->set_output_vector(current);
+        cpu_port->notify_ready();  // Signal completion
+        cout << sc_time_stamp() << " [Accelerator] All layers completed. Final output sent." << endl;
+    }
+};
+
+#endif
+
+cpu acc channel
+
+#ifndef CPU_ACC_CHANNEL_HPP
+#define CPU_ACC_CHANNEL_HPP
+
+#include <systemc>
+#include "CPU_ACC_IF.hpp"
+
+using namespace sc_core;
+using namespace std;
+
+class CPU_ACC_Channel : public sc_module, public CPU_ACC_IF {
+public:
+    SC_CTOR(CPU_ACC_Channel) {}
+
+    // Sync
+    sc_event start_event, done_event, ready_event;
+
+    // Data
+    vector<int> layer_sizes;
+    vector<float> input_vector, output_vector;
+
+    // Control flags
+    bool start_flag = false, done_flag = false, ready_flag = false;
+
+    // CPU to Accelerator
+    void send_start() override {
+        start_flag = true;
+        start_event.notify(SC_ZERO_TIME);
+    }
+
+    void set_layer_sizes(const vector<int>& layers) override {
+        layer_sizes = layers;
+    }
+
+    void set_input_vector(const vector<float>& input) override {
+        input_vector = input;
+    }
+
+    // Accelerator to CPU
+    void wait_done() override {
+        while (!done_flag) wait(done_event);
+        done_flag = false;
+    }
+
+    void wait_ready() override {
+        while (!ready_flag) wait(ready_event);
+        ready_flag = false;
+    }
+
+    void notify_done() {
+        done_flag = true;
+        done_event.notify(SC_ZERO_TIME);
+    }
+
+    void notify_ready() {
+        ready_flag = true;
+        ready_event.notify(SC_ZERO_TIME);
+    }
+
+    void wait_for_start() {
+        while (!start_flag) wait(start_event);
+        start_flag = false;
+    }
+
+    void set_output_vector(const vector<float>& output) {
+        output_vector = output;
+    }
+
+    vector<float> get_output_vector() override {
+        return output_vector;
+    }
+
+    const vector<int>& get_layer_sizes() const { return layer_sizes; }
+    const vector<float>& get_input_vector() const { return input_vector; }
+};
+
+#endif
+
+cpu acc if
+
+#ifndef CPU_ACC_IF_HPP
+#define CPU_ACC_IF_HPP
+
+#include <systemc>
+#include <vector>
+
+using namespace std;
+using namespace sc_core;
+
+class CPU_ACC_IF : public sc_interface {
+public:
+    virtual void send_start() = 0;
+    virtual void wait_done() = 0;
+    virtual void wait_ready() = 0;
+
+    virtual void set_layer_sizes(const vector<int>&) = 0;
+    virtual void set_input_vector(const vector<float>&) = 0;
+    virtual vector<float> get_output_vector() = 0;
+
+    // ✅ Add these to fix your errors:
+    virtual void wait_for_start() = 0;
+    virtual void notify_done() = 0;
+    virtual void notify_ready() = 0;
+    virtual void set_output_vector(const vector<float>&) = 0;
+
+    virtual const vector<int>& get_layer_sizes() const = 0;
+    virtual const vector<float>& get_input_vector() const = 0;
+
+};
+
+#endif
+
+cpu
+
+#ifndef CPU_HPP
+#define CPU_HPP
+
+#include <systemc>
+#include <vector>
+#include <iostream>
+#include "CPU_Mem_IF.hpp"
+#include "CPU_ACC_IF.hpp"
+
+using namespace std;
+using namespace sc_core;
+
+class CPU : public sc_module {
+public:
+    sc_port<CPU_Mem_IF> mem_port;
+    sc_port<CPU_ACC_IF> acc_port;
+
+    SC_CTOR(CPU) {
+        SC_THREAD(process);
+    }
+
+private:
+    void process() {
+        cout << sc_time_stamp() << " [CPU] process() thread started." << endl;
+        wait(5, SC_NS);  // Initial boot delay
+
+        // Receive layer sizes
+        cout << sc_time_stamp() << " [CPU] waiting for layer ready...\n";
+        mem_port->wait_layer_ready();
+
+        cout << sc_time_stamp() << " [CPU] sending ack for layer...\n";
+        mem_port->ack_layer_received();
+
+        cout << sc_time_stamp() << " [CPU] getting layer sizes...\n";
+        vector<int> layer_sizes = mem_port->get_layer_sizes();
+        cout << sc_time_stamp() << " [CPU] Received layer sizes.\n";
+        acc_port->set_layer_sizes(layer_sizes);
+
+        // Receive input vector
+        cout << sc_time_stamp() << " [CPU] waiting for input ready..." << endl;
+        mem_port->wait_input_ready();
+
+        cout << sc_time_stamp() << " [CPU] sending ack for input..." << endl;
+        mem_port->ack_input_received();
+
+        cout << sc_time_stamp() << " [CPU] getting input vector..." << endl;
+        vector<float> input = mem_port->get_input_vector();
+
+        cout << sc_time_stamp() << " [CPU] Received input vector: ";
+        for (auto val : input) cout << val << " ";
+        cout << endl;
+
+        acc_port->set_input_vector(input);
+
+        for (size_t i = 0; i < layer_sizes.size() - 1; ++i) {
+            acc_port->send_start();
+            cout << sc_time_stamp() << " [CPU] Start signal sent for layer " << i << endl;
+            acc_port->wait_done();
+            cout << sc_time_stamp() << " [CPU] Completed layer " << i << endl;
+        }
+
+        acc_port->wait_ready();
+
+        vector<float> output = acc_port->get_output_vector();
+        wait(1, SC_NS);
+        mem_port->write_output_to_memory(output);
+        cout << sc_time_stamp() << " [CPU] Final output written to memory.\n";
+    }
+
+};
+
+#endif
+
+cpu mem channel
+
+#ifndef CPU_MEM_CHANNEL_H
+#define CPU_MEM_CHANNEL_H
+
+#include <systemc>
+#include <vector>
+#include "CPU_Mem_IF.hpp"
+
+using namespace std;
+using namespace sc_core;
+
+class CPU_Mem_Channel : public sc_module, public CPU_Mem_IF {
+public:
+    SC_CTOR(CPU_Mem_Channel) {}
+
+    vector<int> layer_sizes;
+    vector<float> input_vector;
+    vector<float> output_result;
+
+    sc_event ev_layer_ready, ev_input_ready;
+    sc_event ev_layer_ack, ev_input_ack;
+
+    void set_layer_sizes(const vector<int>& layers) {
+        layer_sizes = layers;
+        ev_layer_ready.notify(SC_ZERO_TIME);
+    }
+
+    void set_input_vector(const vector<float>& input) {
+        input_vector = input;
+        ev_input_ready.notify(SC_ZERO_TIME);
+    }
+
+    void wait_layer_ready() override {
+        wait(ev_layer_ready);
+    }
+
+    void wait_input_ready() override {
+        wait(ev_input_ready);
+    }
+
+    void ack_layer_received() override {
+        ev_layer_ack.notify(SC_ZERO_TIME);
+    }
+
+    void ack_input_received() override {
+        ev_input_ack.notify(SC_ZERO_TIME);
+    }
+
+
+    vector<int> get_layer_sizes() override {
+        cout << "[CPU_Mem_Channel] get_layer_sizes() waiting for ack...\n";
+        wait(ev_layer_ack);
+        cout << "[CPU_Mem_Channel] returning layer_sizes.\n";
+        return layer_sizes;
+    }
+
+    vector<float> get_input_vector() override {
+        wait(ev_input_ack);  // Wait for CPU to acknowledge
+        cout << "[CPU_Mem_Channel] returning input_vector." << endl;
+        return input_vector;
+    }
+
+    void write_output_to_memory(const vector<float>& output) override {
+        output_result = output;
+
+        // Console debug
+        cout << "[Memory] Final output written to memory: ";
+        for (auto x : output) cout << x << " ";
+        cout << endl;
+        cout << "[Memory] Output result size: " << output.size() << endl;
+
+        // 💾 Write to CSV
+        ofstream outfile("output.csv");
+        if (outfile.is_open()) {
+            for (size_t i = 0; i < output.size(); ++i) {
+                outfile << output[i];
+                if (i != output.size() - 1)
+                    outfile << ",";
+            }
+            outfile << "\n";
+            outfile.close();
+            cout << "[Memory] Output written to output.csv" << endl;
+        } else {
+            cerr << "[Memory] Failed to open output.csv" << endl;
+        }
+    }
+
+
+    vector<float> get_final_output() {
+        return output_result;
+    }
+
+    void wait_layer_ack() {
+        wait(ev_layer_ack);
+    }
+
+    void wait_input_ack() {
+        wait(ev_input_ack);
+    }
+
+};
+
+#endif
+
+cpu mem if
+
+#ifndef CPU_MEM_IF_H
+#define CPU_MEM_IF_H
+
+#include <systemc>
+#include <vector>
+
+using namespace sc_core;
+using namespace std;
+
+class CPU_Mem_IF : public sc_interface {
+public:
+    virtual vector<int> get_layer_sizes() = 0;
+    virtual vector<float> get_input_vector() = 0;
+    virtual void wait_layer_ready() = 0;
+    virtual void wait_input_ready() = 0;
+    virtual void ack_layer_received() = 0;
+    virtual void ack_input_received() = 0;
+    virtual void write_output_to_memory(const vector<float>& output) = 0;
+    virtual void set_layer_sizes(const vector<int>& layers) = 0;
+    virtual void set_input_vector(const vector<float>& input) = 0;
+};
+
+#endif
+
+
+memory
+
+#ifndef MEMORY_H
+#define MEMORY_H
+
+#include <systemc>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <string>
+
+#include "CPU_Mem_IF.hpp"
+#include "CPU_Mem_Channel.hpp"
+#include "Mem_ACC_IF.hpp"  // ✅ Needed for Accelerator communication
+
+using namespace std;
+using namespace sc_core;
+
+class Memory : public sc_module {
+public:
+    // Ports for CPU and Accelerator interfaces
+    sc_port<CPU_Mem_IF> cpu_if;
+    sc_port<MemACC_IF> acc_if;  // ✅ Added to support MemACC_Channel
+
+    SC_CTOR(Memory) {
+        SC_THREAD(load_and_send);
+    }
+
+private:
+   void load_and_send() {
+        wait(5, SC_NS);  // Let CPU start
+
+        // Load file
+        ifstream file("mlp_data.csv");
+        if (!file.is_open()) {
+            SC_REPORT_ERROR("Memory", "Unable to open mlp_data.csv");
+            return;
+        }
+
+        string line;
+        vector<int> layer_sizes;
+        vector<float> input_vec;
+
+        // Read layer sizes (first line)
+        if (getline(file, line)) {
+            istringstream ss(line);
+            int n;
+            while (ss >> n) layer_sizes.push_back(n);
+        }
+
+        // Read input vector (second line)
+        if (getline(file, line)) {
+            istringstream ss(line);
+            float val;
+            while (ss >> val) input_vec.push_back(val);
+        }
+
+        cout << "[Memory] Loaded layer sizes: ";
+        for (int size : layer_sizes) cout << size << " ";
+        cout << " (total " << layer_sizes.size() << " layers)" << endl;
+
+        cout << "[Memory] Loaded input vector: ";
+        for (float val : input_vec) cout << val << " ";
+        cout << " (size = " << input_vec.size() << ")" << endl;
+
+        // Send layer sizes
+        cpu_if->set_layer_sizes(layer_sizes);
+        wait(1, SC_NS);  // Allow CPU to reach wait_layer_ready()
+        cpu_if->ack_layer_received(); // ✅ notify CPU
+
+        // Send input vector
+        cpu_if->set_input_vector(input_vec);
+        wait(1, SC_NS);  // Allow CPU to reach wait_input_ready()
+        cpu_if->ack_input_received(); // ✅ notify CPU
+    }
+
+};
+
+#endif
+
+mem acc channel 
+
+#ifndef MEM_ACC_CHANNEL_H
+#define MEM_ACC_CHANNEL_H
+
+#include <systemc>
+#include <vector>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include "Mem_ACC_IF.hpp"
+
+using namespace std;
+using namespace sc_core;
+
+class MemACC_Channel : public sc_module, public MemACC_IF {
+public:
+    SC_CTOR(MemACC_Channel) {
+        SC_THREAD(loader);
+
+        load_csv("weights.csv", weights_mem);
+        load_csv("biases.csv", biases_mem);
+    }
+
+    void request_layer(int layer_index, int in_size_, int out_size_) override {
+        cout << sc_time_stamp() << " [MemACC_Channel] Layer " << layer_index
+            << " requested: (" << in_size_ << " -> " << out_size_ << ")" << endl;
+
+        layer_idx = layer_index;
+        in_size = in_size_;
+        out_size = out_size_;
+
+        // Option 1: Load from file (if available)
+        if (!weights_mem[layer_idx].empty() && !biases_mem[layer_idx].empty()) {
+            layer_request_event.notify(SC_ZERO_TIME);
+        }
+        // Option 2: Use dummy data
+        else {
+            weights_flat.clear();
+            biases_flat.clear();
+
+            for (int i = 0; i < out_size * in_size; ++i)
+                weights_flat.push_back(0.1f);
+            for (int i = 0; i < out_size; ++i)
+                biases_flat.push_back(0.05f);
+
+            data_ready_event.notify(SC_ZERO_TIME);
+        }
+    }
+
+
+    void wait_data_ready() override {
+        wait(data_ready_event);
+    }
+
+    vector<float> get_weights() override { return weights_flat; }
+    vector<float> get_biases() override { return biases_flat; }
+
+private:
+    vector<vector<float>> weights_mem[10];
+    vector<vector<float>> biases_mem[10];
+    vector<float> weights_flat;
+    vector<float> biases_flat;
+
+    sc_event layer_request_event, data_ready_event;
+    int layer_idx = 0, in_size = 0, out_size = 0;
+
+   void loader() {
+        while (true) {
+            wait(layer_request_event);  // ✅ THIS is correct for SC_THREAD
+
+            weights_flat.clear();
+            biases_flat.clear();
+
+            for (int i = 0; i < out_size; ++i)
+                for (int j = 0; j < in_size; ++j)
+                    weights_flat.push_back(weights_mem[layer_idx][i][j]);
+
+            for (int i = 0; i < out_size; ++i)
+                biases_flat.push_back(biases_mem[layer_idx][i][0]);
+
+            data_ready_event.notify(SC_ZERO_TIME);
+        }
+    }
+
+
+    void load_csv(const string& filename, vector<vector<float>> storage[10]) {
+        ifstream file(filename);
+        string line;
+        int layer = -1;
+
+        while (getline(file, line)) {
+         
+            if (line == "layer") {
+                ++layer;
+                continue;
+            }
+
+            vector<float> row;
+            stringstream ss(line);
+            string val;
+            while (getline(ss, val, ',')) {
+                if (!val.empty())
+                    row.push_back(stof(val));
+            }
+
+            storage[layer].push_back(row);
+
+            // cout << "[MemACC] [" << filename << "] Layer " << layer << " has "
+            //      << storage[layer].size() << " rows." << endl;
+
+  
+        }
+        file.close();
+    }
+};
+
+#endif
+
+mem acc if
+
+#ifndef MEM_ACC_IF_H
+#define MEM_ACC_IF_H
+
+#include <systemc>
+#include <vector>
+
+using namespace sc_core;
+using namespace std;
+
+class MemACC_IF : public sc_interface {
+public:
+    virtual void request_layer(int layer_idx, int in_size, int out_size) = 0;
+    virtual void wait_data_ready() = 0;
+    virtual vector<float> get_weights() = 0;
+    virtual vector<float> get_biases() = 0;
+};
+
+#endif
+
+
+main 
+
+#include <systemc>
+#include "CPU.hpp"
+#include "Memory.hpp"
+#include "Accelerator.hpp"
+#include "CPU_Mem_Channel.hpp"
+#include "CPU_ACC_Channel.hpp"
+#include "Mem_ACC_Channel.hpp"
+
+using namespace sc_core;
+
+int sc_main(int argc, char* argv[]) {
+    // Instantiate modules
+    CPU cpu("cpu");
+    Memory mem("memory");
+    Accelerator acc("accelerator");
+
+    // Instantiate channels
+    CPU_Mem_Channel cpu_mem_ch("cpu_mem_channel");
+    CPU_ACC_Channel cpu_acc_ch("cpu_acc_channel");
+    MemACC_Channel mem_acc_ch("mem_acc_channel");
+
+    // Bind ports to channels
+    cpu.mem_port(cpu_mem_ch);
+    mem.cpu_if(cpu_mem_ch);
+
+    cpu.acc_port(cpu_acc_ch);
+    acc.cpu_port(cpu_acc_ch);
+
+    acc.mem_port(mem_acc_ch);
+    mem.acc_if(mem_acc_ch);  
+
+    // Start simulation
+    sc_start(1000, SC_NS);
+
+    return 0;
+}
